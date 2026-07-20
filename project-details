@@ -1,0 +1,551 @@
+================================================================================
+  MAIL ANALYZER AGENT — TECHNICAL ARCHITECTURE & COMPLETE FLOW
+================================================================================
+
+Project   : Mail Analyzer Agent
+Stack     : Python 3.11 · FastMCP · LangChain · FastAPI · Gmail API · Pub/Sub
+Pattern   : ReAct Supervisor Agent with MCP Tool Servers (Autonomous)
+Trigger   : Gmail Pub/Sub Webhook (new email → automatic processing)
+
+================================================================================
+  1. TECHNICAL ARCHITECTURE
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         EXTERNAL LAYER                                      │
+│                                                                             │
+│   Gmail Inbox ──→ Google Cloud Pub/Sub ──→ ngrok Tunnel ──→ Webhook Server │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                                           │
+                                                           ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         SERVER LAYER  (src/server/)                         │
+│                                                                             │
+│   FastAPI Application (webhook.py)                                          │
+│   ├── POST /webhook/gmail   ← receives Pub/Sub push notifications           │
+│   ├── GET  /                ← serves the live monitoring dashboard          │
+│   ├── GET  /events          ← Server-Sent Events (SSE) live feed            │
+│   ├── GET  /health          ← liveness + config check                       │
+│   ├── GET  /status          ← full diagnostic JSON                          │
+│   └── POST /test/simulate   ← injects a fake email for pipeline testing     │
+│                                                                             │
+│   Transport: Uvicorn (ASGI) · Threading for background processing           │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                                           │
+                                                           ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      GMAIL SERVICE LAYER  (src/services/gmail/)             │
+│                                                                             │
+│   auth.py       — OAuth2 authentication, token caching, proxy-free transport│
+│   transport.py  — RequestsHttpTransport (replaces httplib2, no proxy issues)│
+│   fetcher.py    — fetch full email by message ID from Gmail API             │
+│   watcher.py    — Gmail Watch API setup, renewal, history polling           │
+│   mcp_server.py — FastMCP server exposing Gmail action tools:               │
+│                   send_reply, label_as_spam, move_to_trash,                 │
+│                   archive_email, add_label, mark_as_read, mark_as_unread    │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                                           │
+                                                           ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      SUPERVISOR AGENT LAYER  (src/agent/)                   │
+│                                                                             │
+│   orchestrator.py — ReAct supervisor loop (replaces LangGraph graph)        │
+│   ├── Runs up to MAX_ITERATIONS=10 LLM → tool call → result cycles         │
+│   ├── Maintains a shared state dict updated from tool results               │
+│   ├── Parses the final JSON recommendation from the last AI message         │
+│   └── Builds and returns the complete final_report dict                     │
+│                                                                             │
+│   mcp_registry.py — Routes tool calls to the correct MCP server            │
+│   ├── Connects in-process to both gmail_mcp and analysis_mcp               │
+│   ├── Lists tool schemas from each server at initialization                 │
+│   └── Executes tools via FastMCP Client, records in session trace           │
+│                                                                             │
+│   parser.py  — Deterministic email field extractor (no LLM)                │
+│   trace.py   — Thread-safe session trace + email data cache                 │
+│               (allows tools to retrieve parsed email by message_id)         │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                                           │
+                                                           ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      ANALYSIS MCP SERVER  (src/mcp/)                        │
+│                                                                             │
+│   analysis_server.py — FastMCP server exposing specialist analysis tools:   │
+│   ├── classify_email        LLM-based email category classification         │
+│   ├── summarize_email       LLM-based summary + action item extraction      │
+│   ├── analyze_security      LLM-based threat analysis + risk scoring        │
+│   ├── analyze_urls          Heuristic URL analysis (no LLM)                 │
+│   ├── analyze_attachments   Static file type analysis (no LLM)              │
+│   ├── search_reputation     DuckDuckGo sender/domain reputation lookup      │
+│   └── generate_reply        LLM-based reply draft generation                │
+│                                                                             │
+│   All tools accept a single `message_id` parameter and retrieve email      │
+│   context directly from the session trace cache.                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                                           │
+                                                           ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      CORE LAYER  (src/core/)                                │
+│                                                                             │
+│   config.py — Loads .env via python-dotenv, exposes all typed constants     │
+│   state.py  — EmailState TypedDict (reference schema for the state dict)    │
+│   utils.py  — LLM factory (Groq/OpenAI/Anthropic/Ollama) + JSON parser     │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                                           │
+                                                           ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      SUPPORT LAYERS                                         │
+│                                                                             │
+│   src/prompts/    — LLM prompt templates (classifier, summarizer,           │
+│                     security, reply, decision)                               │
+│   src/tools/      — url_tools.py (heuristic URL checks)                    │
+│                   — file_tools.py (attachment static analysis)              │
+│                   — search.py (DuckDuckGo web search wrapper)               │
+│   dashboard/      — Single-page HTML monitoring dashboard (SSE-powered)     │
+│   scripts/        — tunnel.py (ngrok manager), start.bat (launcher)         │
+│   secrets/        — credentials.json, token.json (never committed to git)   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+  2. SHARED STATE  (src/agent/orchestrator.py + src/core/state.py)
+================================================================================
+
+The supervisor agent maintains a plain dict (matching EmailState TypedDict)
+that is updated in-place as each tool result comes back.
+
+Field Group              Fields
+─────────────────────────────────────────────────────────────────────────────
+Gmail Identifiers        gmail_message_id, gmail_thread_id, history_id
+Raw Input                raw_email (dict from Gmail API / simulate endpoint)
+Parsed Email             sender, sender_domain, recipients, subject,
+                         body_text, body_html, urls, attachments,
+                         headers, metadata
+Classification           category, category_reason
+Summary                  short_summary, detailed_summary, action_items,
+                         deadlines, meeting_requests, payment_requests,
+                         important_dates
+Security                 security_findings, risk_score (0–100),
+                         severity (Low/Medium/High/Critical),
+                         security_explanation
+URL Analysis             url_analyses (list of URLAnalysis TypedDicts)
+Attachment Analysis      attachment_analyses (list of AttachmentAnalysis)
+Reputation               sender_reputation, domain_reputation,
+                         web_search_summary
+Reply                    reply_tone, suggested_reply
+Decision                 recommendation, recommendation_reasoning
+MCP Actions              mcp_actions_taken (list of MCPAction TypedDicts)
+Internal                 error_messages
+
+The session trace (src/agent/trace.py) is a separate, parallel structure:
+  _traces[session_key]  — ordered list of every tool call + result this run
+  _emails[session_key]  — cached parsed email data (read by analysis tools)
+Both are keyed by message_id AND thread_id and are cleared after the run.
+
+================================================================================
+  3. COMPLETE FLOW — START TO END (EVERY STAGE)
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────
+STAGE 0 — STARTUP
+────────────────────────────────────────────────────────────────────────────
+
+1. Developer runs: scripts\start.bat
+   └── Opens two terminal windows:
+       a. Terminal 1: python scripts\tunnel.py
+          - Authenticates with ngrok using NGROCK_AUTH from .env
+          - Opens a public HTTPS tunnel → port 8000
+          - Writes the ngrok HTTPS URL to WEBHOOK_PUBLIC_URL in .env
+          - Keeps running (heartbeat every 30s, auto-reconnects)
+
+       b. Terminal 2: python -m src.server.webhook
+          - Clears proxy env vars injected by ngrok (prevents SSL errors)
+          - Resets the Gmail service cache
+          - Pre-loads the Gmail MCP server in-process
+          - Starts FastAPI + Uvicorn on API_HOST:API_PORT
+          - Registers routes: /, /health, /status, /events,
+            /webhook/gmail, /test/simulate
+
+2. Developer runs (once, or after 7 days):
+       python -m src.services.gmail.watcher
+   - Authenticates with Gmail via OAuth2 (browser opens on first run)
+   - Calls Gmail Watch API: registers inbox monitoring on PUBSUB_TOPIC
+   - Google will now push a Pub/Sub notification for every new inbox email
+   - Watch expires after 7 days — must be renewed
+
+3. Developer opens browser: http://127.0.0.1:8000
+   - Dashboard loads, JavaScript connects to GET /events (SSE)
+   - Dashboard enters live-listening state
+
+────────────────────────────────────────────────────────────────────────────
+STAGE 1 — EMAIL ARRIVAL TRIGGER
+────────────────────────────────────────────────────────────────────────────
+
+4. A new email arrives in the monitored Gmail inbox.
+
+5. Gmail API detects the new message and publishes a Pub/Sub notification
+   to the configured topic (PUBSUB_TOPIC).
+   Notification payload (base64-encoded JSON):
+     { "emailAddress": "user@gmail.com", "historyId": "15XXX" }
+
+6. Google Cloud Pub/Sub delivers a POST request to:
+     WEBHOOK_PUBLIC_URL/webhook/gmail
+   (forwarded through the ngrok tunnel to localhost:8000)
+
+────────────────────────────────────────────────────────────────────────────
+STAGE 2 — WEBHOOK RECEPTION  (src/server/webhook.py)
+────────────────────────────────────────────────────────────────────────────
+
+7. FastAPI receives POST /webhook/gmail
+   - Reads raw body, parses JSON, decodes base64 Pub/Sub data field
+   - Extracts historyId and emailAddress
+
+8. Deduplication check (historyId level):
+   - If historyId == _last_history_id → skip (duplicate Pub/Sub delivery)
+   - Else → store as _last_history_id, proceed
+
+9. Returns HTTP 200 immediately to Google (must respond within 10 seconds)
+   - All processing is offloaded to a background daemon thread
+
+10. Background thread starts → calls get_history(prev_history_id)
+
+────────────────────────────────────────────────────────────────────────────
+STAGE 3 — MESSAGE DISCOVERY  (src/services/gmail/watcher.py)
+────────────────────────────────────────────────────────────────────────────
+
+11. Gmail History API called with startHistoryId = previous historyId
+    - Returns list of messages added to INBOX since that point
+    - If history returns 0 messages (stale historyId) → FALLBACK:
+      list latest INBOX message directly and process it
+
+12. Deduplication check (message_id level):
+    - Each message_id checked against _processed_message_ids set
+    - If already processed → skip
+    - If new → add to set (capped at 200 entries)
+
+13. SSE broadcast: "processing_started" → dashboard shows email as "Fetching"
+
+────────────────────────────────────────────────────────────────────────────
+STAGE 4 — EMAIL FETCH  (src/services/gmail/fetcher.py)
+────────────────────────────────────────────────────────────────────────────
+
+14. fetch_email(message_id) called
+    - Clears proxy env vars (proxy safety guard)
+    - Calls Gmail API: users.messages.get(format=full)
+    - Walks the MIME payload tree recursively:
+        text/plain  → body_text
+        text/html   → body_html
+        attachmentId present → attachment metadata (filename, mime, size)
+    - Extracts headers: From, To, Cc, Subject
+    - Extracts URLs from body_html using regex
+    - Returns structured raw_email dict
+
+15. SSE broadcast: "email_fetched" → dashboard shows subject + sender
+
+────────────────────────────────────────────────────────────────────────────
+STAGE 5 — PARSER  (src/agent/parser.py)
+────────────────────────────────────────────────────────────────────────────
+
+16. parse_email(state) called synchronously before the supervisor loop
+    INPUT:  raw_email dict
+    PROCESS:
+    - Extracts sender, recipients, subject, body_text, body_html,
+      attachments, headers, metadata
+    - Deduplicates and merges URLs from: raw_email.urls +
+      regex scan of body_text + href/src scan of body_html
+    - Extracts sender_domain from the From address
+    OUTPUT: Updates state dict with all parsed fields
+
+────────────────────────────────────────────────────────────────────────────
+STAGE 6 — SESSION TRACE INIT  (src/agent/trace.py)
+────────────────────────────────────────────────────────────────────────────
+
+17. init_session_trace(message_id, thread_id, email_data=state) called
+    - Stores the parsed state dict in _emails keyed by message_id + thread_id
+    - Creates an empty trace list in _traces keyed by both IDs
+    - Analysis MCP tools will retrieve email data from here by message_id
+
+────────────────────────────────────────────────────────────────────────────
+STAGE 7 — MCP REGISTRY INIT  (src/agent/mcp_registry.py)
+────────────────────────────────────────────────────────────────────────────
+
+18. MCPRegistry().initialize() called
+    - Opens an in-process FastMCP Client connection to gmail_mcp server
+    - Lists all 7 Gmail action tools and registers their schemas
+    - Opens an in-process FastMCP Client connection to analysis_mcp server
+    - Lists all 7 analysis tools and registers their schemas
+    - Total: 14 tools available to the supervisor LLM
+
+────────────────────────────────────────────────────────────────────────────
+STAGE 8 — SUPERVISOR REACT LOOP  (src/agent/orchestrator.py)
+────────────────────────────────────────────────────────────────────────────
+
+19. LLM (Groq/OpenAI/Anthropic/Ollama) is initialised and bound to all 14
+    tool schemas via llm.bind_tools(registry.tools_schema).
+
+20. Initial message list is built:
+    - SystemMessage: SYSTEM_PROMPT with tool descriptions + routing rules
+    - HumanMessage: email fields (sender, domain, subject, body preview,
+      URLs, attachment filenames, headers, message_id, thread_id)
+
+21. LOOP starts (max MAX_ITERATIONS=10 iterations):
+
+    a. LLM is invoked with the current message list.
+
+    b. If the response contains NO tool_calls:
+       - Loop exits → agent is done selecting tools.
+
+    c. If the response contains tool_calls:
+       - For each tool call:
+           i.  Tool name and args are extracted.
+           ii. registry.execute_tool(name, args, session_key) is called.
+               - Opens an in-process FastMCP Client to the correct server.
+               - Calls the tool function.
+               - Appends result to session trace.
+           iii. State dict is updated from the tool result:
+                  classify_email       → category, category_reason
+                  summarize_email      → short_summary, detailed_summary,
+                                         action_items, deadlines, …
+                  analyze_security     → risk_score, severity,
+                                         security_explanation, security_findings
+                  analyze_urls         → url_analyses
+                  analyze_attachments  → attachment_analyses
+                  search_reputation    → sender_reputation, domain_reputation,
+                                         web_search_summary
+                  generate_reply       → suggested_reply, reply_tone
+                  Gmail action tools   → appended to mcp_actions_taken
+           iv.  ToolMessage with result is added to message list.
+
+    d. Updated message list is fed back to the LLM (step a).
+
+22. After the loop, the last AIMessage content is parsed for the final
+    JSON recommendation block:
+    {
+      "recommendation": "...",
+      "reasoning": "..."
+    }
+    If no valid JSON block is found, a regex fallback is tried.
+    If that also fails, the recommendation is inferred from which
+    Gmail action tools were actually executed successfully.
+
+────────────────────────────────────────────────────────────────────────────
+STAGE 9 — TOOL-LEVEL GUARDRAILS  (enforced inside MCP tool functions)
+────────────────────────────────────────────────────────────────────────────
+
+23. Gmail action tools enforce safety rules independently of the LLM:
+
+    move_to_trash:
+    - Checks session trace for a prior analyze_security call.
+    - Refuses if no security check was run.
+    - Refuses if risk_score < AUTO_DELETE_THRESHOLD (default 90).
+    - Returns { "status": "refused", "reason": "..." } on refusal.
+
+    label_as_spam:
+    - Checks session trace for a prior analyze_security call.
+    - Refuses if no security check was run.
+    - Refuses if risk_score < AUTO_SPAM_THRESHOLD (default 75).
+
+    send_reply:
+    - Checks session trace for a prior analyze_security call.
+    - Refuses if risk_score >= REPLY_RISK_THRESHOLD (default 40).
+    - Checks classify_email result; refuses for Spam/Newsletter/
+      Promotion/Shopping categories.
+    - Retrieves sender + subject from trace email cache.
+    - Skips if the thread has already been replied to (_replied_threads set).
+    - Raises ValueError if body contains placeholder text like [your name].
+
+    Simulation bypass:
+    - If message_id or thread_id starts with "sim-" or "test-", all Gmail
+      tools return mock success responses without calling any Gmail API.
+
+────────────────────────────────────────────────────────────────────────────
+STAGE 10 — FINAL REPORT ASSEMBLY  (src/agent/orchestrator.py)
+────────────────────────────────────────────────────────────────────────────
+
+24. After the loop, the state dict is assembled into the final report:
+    {
+      gmail            → message_id, thread_id
+      email_metadata   → sender, sender_domain, recipients, subject
+      classification   → category, reason
+      summary          → short, detailed, action_items, deadlines, …
+      security         → risk_score, severity, explanation, findings
+      url_analysis     → list of URLAnalysis results
+      attachment_analysis → list of AttachmentAnalysis results
+      reputation       → sender_reputation, domain_reputation,
+                         web_search_summary
+      suggested_reply  → tone, draft
+      decision         → recommendation, reasoning
+      mcp_actions      → list of MCPAction results
+      errors           → error_messages from any failed tool calls
+    }
+
+25. clear_session_trace(message_id, thread_id) called
+    - Removes trace and email data from memory.
+
+26. final_report dict is returned from run_email_agent().
+
+────────────────────────────────────────────────────────────────────────────
+STAGE 11 — SSE BROADCAST & DASHBOARD UPDATE
+────────────────────────────────────────────────────────────────────────────
+
+27. _broadcast("analysis_complete", report) called from webhook.py
+    - Serialises final_report to JSON
+    - Pushes to every connected SSE client queue
+    - Dead/full client queues are pruned automatically
+
+28. Browser receives SSE event "analysis_complete"
+    - Updates the feed item: severity badge, recommendation, risk score
+    - If user clicks the feed item → renders full report cards:
+        Decision banner (recommendation + reasoning)
+        Risk score bar (colour-coded green → red)
+        Security findings list (threat type, confidence, description)
+        Classification + summary card
+        URL analysis cards (per URL: suspicious/clean, reasons)
+        Attachment cards (per file: flag, reasons)
+        Sender reputation (web search results)
+        MCP actions taken (status of each Gmail action)
+        Suggested reply draft (with copy button, if generated)
+        Pipeline errors (if any tool call failed)
+
+────────────────────────────────────────────────────────────────────────────
+STAGE 12 — CYCLE COMPLETE
+────────────────────────────────────────────────────────────────────────────
+
+29. run_email_agent() returns final_report.
+    Background thread exits cleanly.
+
+30. Server remains running, waiting for the next Pub/Sub notification.
+    The cycle repeats from Stage 1 for every new email.
+
+================================================================================
+  4. DATA FLOW DIAGRAM
+================================================================================
+
+Gmail Inbox
+    │ new email
+    ▼
+Google Cloud Pub/Sub  ──(HTTPS push)──▶  ngrok Tunnel
+                                              │
+                                              ▼
+                                    FastAPI /webhook/gmail
+                                              │
+                                    ┌─────────┴──────────┐
+                                    │  Dedup (historyId) │
+                                    └─────────┬──────────┘
+                                              │ background thread
+                                              ▼
+                                    Gmail History API
+                                    (get new message IDs)
+                                              │
+                                    ┌─────────┴──────────┐
+                                    │  Dedup (messageId) │
+                                    └─────────┬──────────┘
+                                              │
+                                    Gmail Messages API
+                                    (fetch full email)
+                                              │
+                                              ▼
+                                    ┌─────────────────────────────────────┐
+                                    │    src/agent/orchestrator.py        │
+                                    │                                     │
+                                    │  1. parse_email()                   │
+                                    │  2. init_session_trace()            │
+                                    │  3. MCPRegistry.initialize()        │
+                                    │  4. LLM.bind_tools(14 tools)        │
+                                    │                                     │
+                                    │  ┌── ReAct Loop (max 10 iters) ──┐  │
+                                    │  │                               │  │
+                                    │  │  LLM ──tool_calls──▶ tools   │  │
+                                    │  │   ▲                    │     │  │
+                                    │  │   └──ToolMessage───────┘     │  │
+                                    │  └───────────────────────────────┘  │
+                                    │                                     │
+                                    │  5. Parse recommendation JSON       │
+                                    │  6. Build final_report              │
+                                    │  7. clear_session_trace()           │
+                                    └─────────────────────────────────────┘
+                                              │
+                              ┌───────────────┴───────────────┐
+                              │                               │
+                     ┌────────┴────────┐             ┌────────┴────────┐
+                     │  Analysis MCP   │             │   Gmail MCP     │
+                     │  (in-process)   │             │  (in-process)   │
+                     │                 │             │                 │
+                     │ classify_email  │             │ send_reply      │
+                     │ summarize_email │             │ label_as_spam   │
+                     │ analyze_security│             │ move_to_trash   │
+                     │ analyze_urls    │             │ archive_email   │
+                     │ analyze_attach. │             │ add_label       │
+                     │ search_reputat. │             │ mark_as_read    │
+                     │ generate_reply  │             │ mark_as_unread  │
+                     └─────────────────┘             └────────┬────────┘
+                                                              │ (real emails only)
+                                                              ▼
+                                                        Gmail API
+                                              │
+                                              ▼
+                                    SSE broadcast → Dashboard
+                                    (analysis_complete event)
+
+================================================================================
+  5. MCP TOOL REFERENCE
+================================================================================
+
+  ── Analysis MCP Server (src/mcp/analysis_server.py) ─────────────────────────
+
+  Tool                 Parameter      Returns
+  ───────────────────────────────────────────────────────────────────────────
+  classify_email       message_id     category, category_reason
+  summarize_email      message_id     short_summary, detailed_summary,
+                                      action_items, deadlines,
+                                      meeting_requests, payment_requests,
+                                      important_dates
+  analyze_security     message_id     security_findings, risk_score,
+                                      severity, security_explanation
+  analyze_urls         message_id     url_analyses (list of URLAnalysis)
+  analyze_attachments  message_id     attachment_analyses (list)
+  search_reputation    message_id     sender_reputation, domain_reputation,
+                                      web_search_summary
+  generate_reply       message_id,    suggested_reply, reply_tone
+                       reply_tone?
+
+  ── Gmail Actions MCP Server (src/services/gmail/mcp_server.py) ──────────────
+
+  Tool               Parameters         Returns
+  ───────────────────────────────────────────────────────────────────────────
+  send_reply         thread_id, body    status: sent | skipped | refused
+  label_as_spam      message_id         status: labeled | refused
+  move_to_trash      message_id         status: trashed | refused
+  archive_email      message_id         status: archived
+  add_label          message_id,        status: labeled
+                     label_name
+  mark_as_read       message_id         status: read
+  mark_as_unread     message_id         status: unread
+
+================================================================================
+  6. CONFIGURATION  (.env)
+================================================================================
+
+  Variable                Default                      Description
+  ─────────────────────────────────────────────────────────────────────────────
+  GROQ_API_KEY            (required)                   Groq API key
+  OPENAI_API_KEY          (optional)                   OpenAI API key
+  ANTHROPIC_API_KEY       (optional)                   Anthropic API key
+  MODEL_NAME              meta-llama/llama-4-scout-...  LLM model to use
+  LLM_TEMPERATURE         0                            LLM temperature
+  GMAIL_ADDRESS           (required)                   Monitored inbox address
+  PUBSUB_TOPIC            (required)                   GCP Pub/Sub topic
+  GCP_PROJECT_ID          (required)                   GCP project ID
+  WEBHOOK_PUBLIC_URL      (set by tunnel.py)           Public ngrok HTTPS URL
+  API_HOST                0.0.0.0                      FastAPI bind host
+  API_PORT                8000                         FastAPI bind port
+  DEBUG                   false                        Enable debug logging
+  REPLY_RISK_THRESHOLD    40                           Max risk to send reply
+  AUTO_SPAM_THRESHOLD     75                           Min risk to label spam
+  AUTO_DELETE_THRESHOLD   90                           Min risk to trash
+  DEFAULT_REPLY_TONE      professional                 Reply tone default
+  WEB_SEARCH_MAX_RESULTS  5                            DuckDuckGo result count
+  LABEL_NEEDS_REVIEW      Needs Review                 Gmail label name
+  LABEL_PHISHING_DETECTED Phishing Detected            Gmail label name
+  SIM_MESSAGE_ID          sim-001                      Simulation message ID
+  SIM_THREAD_ID           sim-thread-001               Simulation thread ID
+
+================================================================================

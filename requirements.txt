@@ -1,0 +1,32 @@
+# ── Core ──────────────────────────────────────────────────────────────────────
+pydantic>=2.0.0
+typing-extensions>=4.9.0
+python-dotenv>=1.0.0           # loads .env into environment variables
+
+# ── LangGraph / LangChain ─────────────────────────────────────────────────────
+langgraph>=0.2.0
+langchain>=0.2.0
+langchain-core>=0.2.0
+
+# ── LLM Providers ────────────────────────────────────────────────────────────
+langchain-groq>=0.1.0          # PRIMARY — needs: GROQ_API_KEY
+# langchain-openai>=0.1.0      # fallback — needs: OPENAI_API_KEY
+# langchain-anthropic>=0.1.0   # fallback — needs: ANTHROPIC_API_KEY
+# langchain-ollama>=0.1.0      # fallback — local, no key needed
+
+# ── Gmail API & Google OAuth2 ─────────────────────────────────────────────────
+google-api-python-client>=2.100.0   # Gmail REST API client
+google-auth>=2.23.0                  # Google auth base
+google-auth-oauthlib>=1.1.0          # OAuth2 flow (browser login)
+google-auth-httplib2>=0.2.0          # HTTP transport for google-auth
+
+# ── Webhook & API Server ──────────────────────────────────────────────────────
+fastapi>=0.110.0               # webhook + SSE server
+uvicorn[standard]>=0.29.0      # ASGI server
+
+# ── MCP ───────────────────────────────────────────────────────────────────────
+fastmcp>=2.0.0                 # MCP server + client framework for Gmail tools
+
+# ── Tools ─────────────────────────────────────────────────────────────────────
+duckduckgo-search>=6.0.0       # Agent 7 — sender/domain reputation search
+requests>=2.31.0               # URL expansion (follow redirects)

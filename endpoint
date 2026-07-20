@@ -1,0 +1,563 @@
+================================================================================
+  MAIL ANALYZER AGENT — COMPLETE ENDPOINT REFERENCE
+================================================================================
+
+Base URL (local)  : http://127.0.0.1:8000
+Base URL (public) : https://<your-ngrok-url>   (set in WEBHOOK_PUBLIC_URL)
+
+All responses are JSON unless otherwise stated.
+The agent is fully autonomous — real emails trigger it automatically via
+Gmail Pub/Sub. Use POST /test/simulate to trigger the pipeline manually.
+
+================================================================================
+  ENDPOINT INDEX
+================================================================================
+
+  1.  GET  /                    Serve live monitoring dashboard (HTML)
+  2.  GET  /health              Liveness check
+  3.  GET  /status              Full configuration diagnostic
+  4.  GET  /events              Server-Sent Events live stream
+  5.  POST /webhook/gmail       Gmail Pub/Sub push notification (auto-trigger)
+  6.  POST /test/simulate       Manually inject a test email into the pipeline
+
+================================================================================
+  1. GET /
+================================================================================
+
+Description:
+  Serves the live monitoring dashboard (dashboard/index.html).
+  Open this in a browser to watch emails being processed in real time.
+
+URL:
+  GET http://127.0.0.1:8000/
+
+Response:
+  Status  : 200 OK
+  Content-Type : text/html; charset=utf-8
+  Body    : Full HTML page (dashboard/index.html)
+
+  On missing dashboard file:
+  Status  : 404 Not Found
+  Body    : <h1>Dashboard not found</h1>
+
+Example (browser):
+  Open: http://127.0.0.1:8000/
+
+================================================================================
+  2. GET /health
+================================================================================
+
+Description:
+  Lightweight liveness check. Returns server status, the configured
+  Pub/Sub push endpoint URL, number of connected SSE clients, and the
+  last processed historyId.
+
+URL:
+  GET http://127.0.0.1:8000/health
+
+Response:
+  Status  : 200 OK
+  Content-Type : application/json
+
+  Body:
+  {
+    "status": "ok",
+    "webhook_url": "https://<ngrok-url>/webhook/gmail",
+    "connected_clients": 1,
+    "last_history_id": "12345"
+  }
+
+  Field descriptions:
+  ┌─────────────────────┬──────────┬─────────────────────────────────────────┐
+  │ Field               │ Type     │ Description                             │
+  ├─────────────────────┼──────────┼─────────────────────────────────────────┤
+  │ status              │ string   │ Always "ok" if server is running        │
+  │ webhook_url         │ string   │ The URL Google pushes Pub/Sub events to │
+  │ connected_clients   │ integer  │ Number of active SSE dashboard clients  │
+  │ last_history_id     │ string   │ Last Gmail historyId received, or "none"│
+  └─────────────────────┴──────────┴─────────────────────────────────────────┘
+
+Example (curl):
+  curl http://127.0.0.1:8000/health
+
+================================================================================
+  3. GET /status
+================================================================================
+
+Description:
+  Full configuration diagnostic. Shows every config value, whether
+  required files exist, and a list of issues preventing the agent from
+  working. Use this to debug setup problems.
+
+URL:
+  GET http://127.0.0.1:8000/status
+
+Response:
+  Status  : 200 OK
+  Content-Type : application/json
+
+  Body (healthy):
+  {
+    "status": "ready",
+    "config": {
+      "gmail_address": "your-inbox@gmail.com",
+      "pubsub_topic": "projects/your-project-id/topics/your-topic-name",
+      "gcp_project_id": "your-project-id",
+      "webhook_url": "https://<ngrok-url>/webhook/gmail",
+      "credentials_exists": true,
+      "token_exists": true,
+      "sse_clients": 1,
+      "processed_messages": 12
+    },
+    "issues": []
+  }
+
+  Body (misconfigured):
+  {
+    "status": "misconfigured",
+    "config": {
+      "gmail_address": "",
+      "pubsub_topic": "",
+      "gcp_project_id": "your-project-id",
+      "webhook_url": "/webhook/gmail",
+      "credentials_exists": false,
+      "token_exists": false,
+      "sse_clients": 0,
+      "processed_messages": 0
+    },
+    "issues": [
+      "GMAIL_ADDRESS not set in .env",
+      "PUBSUB_TOPIC not set in .env",
+      "GCP_PROJECT_ID not set in .env",
+      "WEBHOOK_PUBLIC_URL not set in .env",
+      "credentials.json not found in secrets/",
+      "token.json missing — run: python -m src.services.gmail.watcher"
+    ]
+  }
+
+  Field descriptions:
+  ┌──────────────────────┬─────────┬──────────────────────────────────────────┐
+  │ Field                │ Type    │ Description                              │
+  ├──────────────────────┼─────────┼──────────────────────────────────────────┤
+  │ status               │ string  │ "ready" or "misconfigured"               │
+  │ config.gmail_address │ string  │ Monitored Gmail inbox address            │
+  │ config.pubsub_topic  │ string  │ Google Cloud Pub/Sub topic name          │
+  │ config.gcp_project_id│ string  │ Google Cloud project ID                  │
+  │ config.webhook_url   │ string  │ Public push endpoint for Pub/Sub         │
+  │ config.credentials_  │ boolean │ Whether credentials.json exists in       │
+  │       exists         │         │ secrets/                                 │
+  │ config.token_exists  │ boolean │ Whether token.json exists in secrets/    │
+  │ config.sse_clients   │ integer │ Active SSE connections                   │
+  │ config.processed_    │ integer │ Total messages processed since startup   │
+  │       messages       │         │                                          │
+  │ issues               │ array   │ List of config problems found (empty=[]) │
+  └──────────────────────┴─────────┴──────────────────────────────────────────┘
+
+Example (curl):
+  curl http://127.0.0.1:8000/status
+
+================================================================================
+  4. GET /events
+================================================================================
+
+Description:
+  Server-Sent Events (SSE) stream. The dashboard connects here to receive
+  live updates as emails are processed. Each event is a JSON object on a
+  single "data:" line. Can also be consumed by any SSE-capable client.
+
+URL:
+  GET http://127.0.0.1:8000/events
+
+Request:
+  Headers : Accept: text/event-stream   (optional but recommended)
+
+Response:
+  Status       : 200 OK
+  Content-Type : text/event-stream
+  Cache-Control: no-cache
+  Connection   : keep-alive (long-lived stream)
+
+  Every event line format:
+    data: <JSON object>\n\n
+
+  Heartbeat (every 20s to keep connection alive):
+    : heartbeat\n\n
+
+────────────────────────────────────────────────────────────────────────────
+  Event Types
+────────────────────────────────────────────────────────────────────────────
+
+  All events share this outer envelope:
+  {
+    "type": "<event_type>",
+    "timestamp": "2026-01-15T11:19:55.255Z",
+    "data": { ... }
+  }
+
+  ── Event: connected ─────────────────────────────────────────────────────
+  Fired immediately after the SSE connection is established.
+
+  {
+    "type": "connected",
+    "timestamp": "2026-01-15T11:19:55.255Z",
+    "data": {}
+  }
+
+  ── Event: processing_started ────────────────────────────────────────────
+  Fired when a new message ID is picked up and about to be fetched.
+
+  {
+    "type": "processing_started",
+    "timestamp": "2026-01-15T11:19:55.255Z",
+    "data": {
+      "message_id": "1a2b3c4d5e6f7890"
+    }
+  }
+
+  ── Event: email_fetched ─────────────────────────────────────────────────
+  Fired after the full email is retrieved from the Gmail API.
+
+  {
+    "type": "email_fetched",
+    "timestamp": "2026-01-15T11:19:56.100Z",
+    "data": {
+      "message_id": "1a2b3c4d5e6f7890",
+      "subject": "Meeting tomorrow at 10am",
+      "sender": "John Smith <john.smith@example.com>"
+    }
+  }
+
+  ── Event: analysis_complete ─────────────────────────────────────────────
+  Fired when the supervisor agent has finished all tool calls and the
+  final report is ready. This is the main output event.
+
+  {
+    "type": "analysis_complete",
+    "timestamp": "2026-01-15T11:20:44.000Z",
+    "data": {
+      <full report object — see Full Report Schema section below>
+    }
+  }
+
+  ── Event: processing_error ──────────────────────────────────────────────
+  Fired if the pipeline fails for a message.
+
+  {
+    "type": "processing_error",
+    "timestamp": "2026-01-15T11:20:44.000Z",
+    "data": {
+      "message_id": "1a2b3c4d5e6f7890",
+      "error": "Failed to fetch email: connection timeout"
+    }
+  }
+
+Example (JavaScript):
+  const es = new EventSource('http://127.0.0.1:8000/events');
+  es.onmessage = (e) => {
+    const event = JSON.parse(e.data);
+    if (event.type === 'analysis_complete') {
+      console.log(event.data.decision.recommendation);
+    }
+  };
+
+Example (curl):
+  curl -N http://127.0.0.1:8000/events
+
+================================================================================
+  5. POST /webhook/gmail
+================================================================================
+
+Description:
+  Receives Gmail Pub/Sub push notifications from Google Cloud.
+  This endpoint is called AUTOMATICALLY by Google — you never call it
+  manually. Google calls it every time a new email arrives in the
+  monitored Gmail inbox.
+
+  Requirements:
+  - Must be publicly reachable via HTTPS (use ngrok in development)
+  - Must respond within 10 seconds or Google retries the delivery
+  - Must return HTTP 200 to acknowledge receipt
+
+URL:
+  POST https://<your-ngrok-url>/webhook/gmail
+  (or http://127.0.0.1:8000/webhook/gmail for local testing)
+
+Request:
+  Method       : POST
+  Content-Type : application/json
+  Body         : Google Cloud Pub/Sub push message format
+
+  {
+    "message": {
+      "data": "<base64url-encoded JSON string>",
+      "messageId": "12345678901234567",
+      "message_id": "12345678901234567",
+      "publishTime": "2026-01-15T10:34:29.535Z",
+      "publish_time": "2026-01-15T10:34:29.535Z"
+    },
+    "subscription": "projects/your-project-id/subscriptions/your-subscription-name"
+  }
+
+  The "data" field base64-decodes to:
+  {
+    "emailAddress": "your-inbox@gmail.com",
+    "historyId": "12345"
+  }
+
+  Field descriptions:
+  ┌──────────────────────┬────────┬──────────────────────────────────────────┐
+  │ Field                │ Type   │ Description                              │
+  ├──────────────────────┼────────┼──────────────────────────────────────────┤
+  │ message.data         │ string │ Base64url-encoded notification payload   │
+  │ message.messageId    │ string │ Pub/Sub message ID (not Gmail message ID)│
+  │ message.publishTime  │ string │ ISO 8601 timestamp from Google           │
+  │ subscription         │ string │ Full Pub/Sub subscription resource name  │
+  │ data.emailAddress    │ string │ The monitored Gmail address              │
+  │ data.historyId       │ string │ Gmail history ID — used to fetch new msgs│
+  └──────────────────────┴────────┴──────────────────────────────────────────┘
+
+Response:
+  Status  : 200 OK
+  Body    : (empty)
+
+  If invalid JSON:
+  Status  : 204 No Content
+
+  If data field is empty or undecodable:
+  Status  : 204 No Content
+
+  NOTE: HTTP 204 tells Google "received but nothing to do".
+        HTTP 200 tells Google "received and processing".
+        Any non-2xx response causes Google to retry delivery.
+
+Processing (after responding 200):
+  All processing happens in a background thread:
+  1. Calls Gmail History API (startHistoryId = previous historyId)
+  2. For each new message ID found → fetch full email → run supervisor agent
+  3. If history returns nothing → fallback: fetch latest inbox message
+  4. Results broadcast to all SSE clients via /events
+
+================================================================================
+  6. POST /test/simulate
+================================================================================
+
+Description:
+  Injects a pre-built fake phishing email directly into the supervisor
+  agent without needing Gmail, Pub/Sub, or a real email. Use this to
+  verify the full pipeline works end-to-end.
+
+  The simulated email uses IDs prefixed with "sim-" so Gmail action tools
+  automatically return mock responses without making real API calls.
+
+URL:
+  POST http://127.0.0.1:8000/test/simulate
+
+Request:
+  Method  : POST
+  Body    : (none)
+
+Response:
+  Status       : 200 OK
+  Content-Type : application/json
+
+  Body:
+  {
+    "status": "simulation started",
+    "dashboard": "http://127.0.0.1:8000"
+  }
+
+  NOTE: The response returns immediately. The agent runs in a background
+        thread. Watch the live results at http://127.0.0.1:8000 or by
+        connecting to GET /events.
+
+Simulated email content:
+  {
+    "sender":  "Security Team <security@paypa1-alert.com>",
+    "subject": "URGENT: Your account has been suspended",
+    "body":    "Phishing email with suspicious URL and .exe attachment",
+    "urls":    ["http://paypa1-alert.com/verify?token=abc123"],
+    "attachments": [{ "filename": "invoice.pdf.exe", "size_bytes": 512000 }],
+    "headers": { "Reply-To": "harvest@scam.ru" }
+  }
+
+  Expected agent output:
+  - category    : Spam or Phishing
+  - risk_score  : 80–100
+  - severity    : High or Critical
+  - recommendation : High-risk phishing attempt or Mark as spam
+  - suggested_reply : (empty — reply is suppressed for high-risk emails)
+  - mcp_actions : [{ "action": "move_to_trash", "status": "trashed",
+                     "detail": "Mock moved to trash (simulation)" }]
+
+Example (curl):
+  curl -X POST http://127.0.0.1:8000/test/simulate
+
+Example (PowerShell):
+  Invoke-RestMethod -Method POST -Uri http://127.0.0.1:8000/test/simulate
+
+================================================================================
+  FULL REPORT SCHEMA  (returned in analysis_complete SSE event)
+================================================================================
+
+{
+  "gmail": {
+    "message_id": "1a2b3c4d5e6f7890",       // Gmail message ID
+    "thread_id":  "1a2b3c4d5e6f0000"        // Gmail thread ID
+  },
+
+  "email_metadata": {
+    "sender":        "John Smith <john.smith@example.com>",
+    "sender_domain": "example.com",
+    "recipients":    ["your-inbox@gmail.com"],
+    "subject":       "Project update for Q3"
+  },
+
+  "classification": {
+    "category": "Work",                     // Work | Personal | Finance |
+                                            // Shopping | Newsletter |
+                                            // Promotion | Support | Spam | Unknown
+    "reason": "The email discusses a work-related project update."
+  },
+
+  "summary": {
+    "short":    "John sent a Q3 project status update requesting feedback.",
+    "detailed": "The sender John Smith has shared an update on the Q3 project...",
+    "action_items":     ["Review the attached report", "Reply with feedback"],
+    "deadlines":        ["Friday, January 19"],
+    "meeting_requests": [],
+    "payment_requests": [],
+    "important_dates":  ["January 19 — report deadline"]
+  },
+
+  "security": {
+    "risk_score":  5,                       // 0 (clean) to 100 (confirmed attack)
+    "severity":    "Low",                   // Low | Medium | High | Critical
+    "explanation": "The email appears legitimate with no detected threats.",
+    "findings": [
+      {
+        "threat_type": "Suspicious Urgency",
+        "description": "Slight urgency in tone but no clear threat.",
+        "confidence":  "low"                // low | medium | high
+      }
+    ]
+  },
+
+  "url_analysis": [
+    {
+      "url":          "https://example.com/report",
+      "is_https":     true,
+      "is_shortened": false,
+      "domain":       "example.com",
+      "suspicious":   false,
+      "reasons":      [],
+      "final_url":    null                  // non-null if URL was expanded
+    }
+  ],
+
+  "attachment_analysis": [
+    {
+      "filename":   "Q3_Report.pdf",
+      "extension":  ".pdf",
+      "mime_type":  "application/pdf",
+      "size_bytes": 204800,
+      "suspicious": false,
+      "reasons":    []
+    }
+  ],
+
+  "reputation": {
+    "sender_reputation":  "No results found.",
+    "domain_reputation":  "No results found.",
+    "web_search_summary": "Sender (john.smith@example.com):\nNo results found.\n\nDomain (example.com):\nNo results found."
+  },
+
+  "suggested_reply": {
+    "tone":  "professional",                // professional | friendly | formal | ""
+    "draft": "Thank you for the update. I will review the report and get back to you."
+                                            // empty string if reply was suppressed
+  },
+
+  "decision": {
+    "recommendation": "Safe to reply",     // Safe to reply |
+                                            // Archive |
+                                            // Mark as spam |
+                                            // Delete |
+                                            // Requires manual review |
+                                            // High-risk phishing attempt
+    "reasoning": "The email is a legitimate work communication with low risk score and no detected threats."
+  },
+
+  "mcp_actions": [
+    {
+      "action": "send_reply",              // Gmail action performed
+      "status": "sent",                    // sent | done | trashed | archived |
+                                           // labeled | read | unread |
+                                           // skipped | refused | failed
+      "detail": "OK"                       // "OK", mock message, skip reason,
+                                           // refuse reason, or error message
+    },
+    {
+      "action": "mark_as_read",
+      "status": "done",
+      "detail": "OK"
+    }
+  ],
+
+  "errors": []                             // List of agent error messages, if any
+}
+
+================================================================================
+  DECISION → MCP ACTION MAPPING
+================================================================================
+
+  The supervisor agent decides which Gmail tools to call based on its
+  analysis. The following are the intended mappings:
+
+  Decision                     → Gmail Actions Taken
+  ────────────────────────────────────────────────────────────────────────────
+  Safe to reply                → generate_reply → send_reply + mark_as_read
+  Archive                      → archive_email + mark_as_read
+  Mark as spam                 → label_as_spam (SPAM label, removed from INBOX)
+  Delete                       → move_to_trash
+  Requires manual review       → add_label("Needs Review") + mark_as_unread
+  High-risk phishing attempt   → move_to_trash + add_label("Phishing Detected")
+
+  Tool-level guardrails (enforced inside the MCP tools themselves):
+  ┌──────────────────────┬────────────────────────────────────────────────────┐
+  │ Tool                 │ Requirement                                        │
+  ├──────────────────────┼────────────────────────────────────────────────────┤
+  │ move_to_trash        │ analyze_security must have been called first AND   │
+  │                      │ risk_score >= AUTO_DELETE_THRESHOLD (default 90)   │
+  ├──────────────────────┼────────────────────────────────────────────────────┤
+  │ label_as_spam        │ analyze_security must have been called first AND   │
+  │                      │ risk_score >= AUTO_SPAM_THRESHOLD (default 75)     │
+  ├──────────────────────┼────────────────────────────────────────────────────┤
+  │ send_reply           │ analyze_security must have been called first AND   │
+  │                      │ risk_score < REPLY_RISK_THRESHOLD (default 40) AND │
+  │                      │ category NOT in Spam/Newsletter/Promotion/Shopping │
+  └──────────────────────┴────────────────────────────────────────────────────┘
+
+  If a tool's guardrail is not satisfied it returns:
+    { "status": "refused", "reason": "<explanation>" }
+  and no Gmail API call is made. The supervisor agent sees the refusal
+  and adjusts its plan accordingly.
+
+  Simulation bypass:
+  When message_id or thread_id starts with "sim-" or "test-", every
+  Gmail action tool returns a mock success response without calling
+  the real Gmail API.
+
+================================================================================
+  QUICK REFERENCE
+================================================================================
+
+  Purpose                        Method  URL
+  ────────────────────────────────────────────────────────────────────────────
+  View dashboard                 GET     http://127.0.0.1:8000/
+  Check server health            GET     http://127.0.0.1:8000/health
+  Diagnose configuration         GET     http://127.0.0.1:8000/status
+  Connect to live event stream   GET     http://127.0.0.1:8000/events
+  Manually test the pipeline     POST    http://127.0.0.1:8000/test/simulate
+  Auto-trigger (Google only)     POST    https://<ngrok>/webhook/gmail
+
+================================================================================

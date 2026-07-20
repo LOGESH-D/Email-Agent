@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Email Security Agent — Live Monitor</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%236366f1'/><path d='M6 10l10 7 10-7' stroke='white' stroke-width='2' fill='none' stroke-linecap='round'/><rect x='6' y='10' width='20' height='14' rx='2' stroke='white' stroke-width='2' fill='none'/></svg>" />
+  <script src="https://cdn.tailwindcss.com?plugins=forms"></script>
+  <!-- Tailwind CDN is fine for development. For production: npx tailwindcss build -->
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: { brand: { DEFAULT: '#6366f1', dark: '#4f46e5' } },
+          animation: { 'pulse-slow': 'pulse 3s cubic-bezier(0.4,0,0.6,1) infinite' }
+        }
+      }
+    }
+  </script>
+  <style>
+    .fade-in  { animation: fadeIn .35s ease-out; }
+    .slide-in { animation: slideIn .3s ease-out; }
+    @keyframes fadeIn  { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+    @keyframes slideIn { from { opacity:0; transform:translateX(-8px); } to { opacity:1; transform:none; } }
+    .spinner  { border-top-color:#6366f1; animation:spin .9s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    ::-webkit-scrollbar { width:6px; }
+    ::-webkit-scrollbar-track { background:#111827; }
+    ::-webkit-scrollbar-thumb { background:#374151; border-radius:3px; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen font-sans flex flex-col">
+
+<!-- ── Top bar ─────────────────────────────────────────────────────────────── -->
+<header class="border-b border-gray-800 px-6 py-3 flex items-center gap-3 shrink-0">
+  <div class="w-8 h-8 rounded-lg bg-brand flex items-center justify-center">
+    <svg class="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+        d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+    </svg>
+  </div>
+  <div class="flex-1">
+    <h1 class="text-sm font-semibold">AI Email Security Agent</h1>
+    <p class="text-xs text-gray-500">Autonomous Gmail Monitor · LangGraph 10-Agent Pipeline</p>
+  </div>
+
+  <!-- Stats bar -->
+  <div class="hidden sm:flex items-center gap-6 text-xs text-gray-400 mr-4">
+    <span>Processed: <span id="statTotal" class="text-white font-semibold">0</span></span>
+    <span>Threats: <span id="statThreats" class="text-red-400 font-semibold">0</span></span>
+    <span>Safe: <span id="statSafe" class="text-green-400 font-semibold">0</span></span>
+  </div>
+
+  <!-- Connection status -->
+  <div class="flex items-center gap-2 text-xs">
+    <span id="connDot" class="w-2 h-2 rounded-full bg-gray-600 inline-block transition-colors"></span>
+    <span id="connLabel" class="text-gray-500">Disconnected</span>
+    <button onclick="connect()" id="connectBtn"
+      class="ml-2 px-3 py-1 rounded-md bg-brand hover:bg-brand-dark transition-colors text-white text-xs font-medium">
+      Connect
+    </button>
+  </div>
+</header>
+
+<!-- ── Main layout ──────────────────────────────────────────────────────────── -->
+<div class="flex flex-1 overflow-hidden">
+
+  <!-- ── Left: email feed ──────────────────────────────────────────────────── -->
+  <aside class="w-80 border-r border-gray-800 flex flex-col shrink-0">
+    <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
+      <span class="text-xs font-semibold uppercase tracking-widest text-gray-500">Inbox Feed</span>
+      <button onclick="clearFeed()" class="text-xs text-gray-600 hover:text-gray-400">Clear</button>
+    </div>
+    <div id="emailFeed" class="flex-1 overflow-y-auto divide-y divide-gray-800/60">
+      <div class="flex flex-col items-center justify-center h-48 text-gray-700 text-xs gap-2">
+        <svg class="w-8 h-8 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+            d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2M4 13h2m6 0v6"/>
+        </svg>
+        <span>Waiting for emails…</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ── Right: detail panel ────────────────────────────────────────────────── -->
+  <main class="flex-1 overflow-y-auto">
+
+    <!-- Empty state -->
+    <div id="detailEmpty" class="flex flex-col items-center justify-center h-full text-gray-700 gap-3">
+      <svg class="w-12 h-12 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+          d="M9 17v-2m3 2v-4m3 4v-6M4 20h16a1 1 0 001-1V5a1 1 0 00-1-1H4a1 1 0 00-1 1v14a1 1 0 001 1z"/>
+      </svg>
+      <p class="text-sm">Select an email from the feed to see its full report</p>
+    </div>
+
+    <!-- Processing indicator -->
+    <div id="detailLoading" class="hidden flex flex-col items-center justify-center h-full gap-4">
+      <div class="w-10 h-10 rounded-full border-4 border-gray-700 spinner"></div>
+      <p class="text-sm text-gray-400" id="loadingText">Running 10-agent pipeline…</p>
+      <div id="agentProgress" class="flex flex-wrap gap-2 justify-center max-w-sm"></div>
+    </div>
+
+    <!-- Report detail -->
+    <div id="detailContent" class="hidden p-6 space-y-4 fade-in max-w-3xl mx-auto"></div>
+
+  </main>
+</div>
+
+<!-- ── Log drawer (bottom) ────────────────────────────────────────────────── -->
+<div class="border-t border-gray-800 shrink-0">
+  <button onclick="toggleLog()"
+    class="w-full px-4 py-2 text-xs text-gray-500 hover:text-gray-300 text-left flex items-center gap-2">
+    <svg id="logChevron" class="w-3 h-3 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+    </svg>
+    Event Log
+    <span id="logBadge" class="ml-auto bg-gray-800 text-gray-400 px-1.5 rounded text-xs">0</span>
+  </button>
+  <div id="logPanel" class="hidden h-32 overflow-y-auto px-4 pb-2 font-mono text-xs text-gray-500 space-y-0.5"></div>
+</div>
+
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+// Always connect to the FastAPI server.
+// Open this page at http://127.0.0.1:8000 — NOT from file://
+const API_BASE = 'http://127.0.0.1:8000';
+const EVENTS_URL = `${API_BASE}/events`;
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let evtSource = null;
+let reports = {};          // message_id → report
+let pendingIds = {};       // message_id → { subject, sender }
+let selectedId = null;
+let stats = { total: 0, threats: 0, safe: 0 };
+let logCount = 0;
+
+// ── Severity / recommendation colours ────────────────────────────────────────
+const SEV_CLS = {
+  Low:      'bg-green-900  text-green-300  border-green-700',
+  Medium:   'bg-yellow-900 text-yellow-300 border-yellow-700',
+  High:     'bg-orange-900 text-orange-300 border-orange-700',
+  Critical: 'bg-red-900    text-red-300    border-red-700',
+};
+const REC_CLS = {
+  'Safe to reply':             'text-green-400',
+  'Archive':                   'text-blue-400',
+  'Mark as spam':              'text-yellow-400',
+  'Delete':                    'text-orange-400',
+  'Requires manual review':    'text-purple-400',
+  'High-risk phishing attempt':'text-red-400',
+};
+const REC_ICON = {
+  'Safe to reply':             '✓',
+  'Archive':                   '📁',
+  'Mark as spam':              '🚫',
+  'Delete':                    '🗑',
+  'Requires manual review':    '⚠',
+  'High-risk phishing attempt':'🎣',
+};
+
+// ── Connection ────────────────────────────────────────────────────────────────
+function connect() {
+  if (evtSource) { evtSource.close(); evtSource = null; }
+
+  setConn('connecting');
+  evtSource = new EventSource(EVENTS_URL);
+
+  evtSource.onopen = () => {
+    setConn('connected');
+    log('system', 'Connected to agent webhook server');
+  };
+
+  evtSource.onmessage = (e) => {
+    try { handleEvent(JSON.parse(e.data)); } catch(_) {}
+  };
+
+  evtSource.onerror = () => {
+    setConn('disconnected');
+    log('error', 'Connection lost — retrying automatically');
+  };
+}
+
+function disconnect() {
+  if (evtSource) { evtSource.close(); evtSource = null; }
+  setConn('disconnected');
+}
+
+function setConn(state) {
+  const dot   = document.getElementById('connDot');
+  const label = document.getElementById('connLabel');
+  const btn   = document.getElementById('connectBtn');
+  const map   = {
+    connecting:   ['bg-yellow-400 animate-pulse', 'Connecting…',   'Cancel',     'onclick="disconnect()"'],
+    connected:    ['bg-green-500',                'Live',           'Disconnect', 'onclick="disconnect()"'],
+    disconnected: ['bg-gray-600',                 'Disconnected',   'Connect',    'onclick="connect()"'],
+  };
+  const [cls, lbl, btnTxt, btnEvt] = map[state] || map.disconnected;
+  dot.className   = `w-2 h-2 rounded-full inline-block transition-colors ${cls}`;
+  label.textContent = lbl;
+  btn.textContent = btnTxt;
+  btn.setAttribute('onclick', btnEvt.slice(8, -1));
+}
+
+// ── Event handler ─────────────────────────────────────────────────────────────
+function handleEvent(event) {
+  const { type, data, timestamp } = event;
+
+  if (type === 'connected') {
+    log('system', 'Agent ready');
+    return;
+  }
+
+  if (type === 'processing_started') {
+    const id = data.message_id;
+    pendingIds[id] = data;
+    addFeedItem(id, '(loading…)', '(fetching…)', 'processing');
+    log('info', `New email detected — id: ${id}`);
+    if (selectedId === id) showLoading(id, 'Fetching email from Gmail…');
+    return;
+  }
+
+  if (type === 'email_fetched') {
+    const id = data.message_id;
+    if (pendingIds[id]) {
+      pendingIds[id].subject = data.subject;
+      pendingIds[id].sender  = data.sender;
+    }
+    updateFeedItem(id, data.subject, data.sender, 'analysing');
+    log('info', `Analysing: "${data.subject}" from ${data.sender}`);
+    if (selectedId === id) showLoading(id, 'Running 10-agent pipeline…');
+    return;
+  }
+
+  if (type === 'analysis_complete') {
+    const id = data.gmail?.message_id || data.email_metadata?.sender;
+    const msgId = data.gmail?.message_id;
+    if (msgId) {
+      reports[msgId] = data;
+      const rec  = data.decision?.recommendation || '';
+      const risk = data.security?.risk_score ?? 0;
+      const sev  = data.security?.severity || 'Low';
+      stats.total++;
+      if (risk >= 40) stats.threats++; else stats.safe++;
+      updateStats();
+      updateFeedItem(msgId, data.email_metadata?.subject, data.email_metadata?.sender, 'done', sev, rec);
+      log('info', `✓ ${data.email_metadata?.subject} → ${rec} (risk ${risk})`);
+      if (selectedId === msgId) renderReport(msgId);
+    }
+    return;
+  }
+
+  if (type === 'processing_error') {
+    const id = data.message_id;
+    updateFeedItem(id, pendingIds[id]?.subject || id, pendingIds[id]?.sender || '', 'error');
+    log('error', `Error processing ${id}: ${data.error}`);
+    if (selectedId === id) {
+      document.getElementById('detailLoading').classList.add('hidden');
+      document.getElementById('detailEmpty').classList.remove('hidden');
+    }
+  }
+}
+
+// ── Feed management ───────────────────────────────────────────────────────────
+function addFeedItem(id, subject, sender, status, severity, rec) {
+  const feed = document.getElementById('emailFeed');
+  // Remove empty-state placeholder
+  const placeholder = feed.querySelector('.flex-col');
+  if (placeholder) placeholder.remove();
+
+  const existing = document.getElementById(`feed-${id}`);
+  if (existing) { updateFeedItem(id, subject, sender, status, severity, rec); return; }
+
+  const el = document.createElement('div');
+  el.id = `feed-${id}`;
+  el.className = 'px-4 py-3 cursor-pointer hover:bg-gray-900 transition-colors slide-in border-l-2 border-transparent';
+  el.onclick = () => selectEmail(id);
+  el.innerHTML = feedItemHTML(id, subject, sender, status, severity, rec);
+  feed.prepend(el);
+}
+
+function updateFeedItem(id, subject, sender, status, severity, rec) {
+  const el = document.getElementById(`feed-${id}`);
+  if (!el) { addFeedItem(id, subject, sender, status, severity, rec); return; }
+  el.innerHTML = feedItemHTML(id, subject, sender, status, severity, rec);
+
+  // Highlight border by severity
+  el.className = el.className.replace(/border-\S+/, '');
+  const borderMap = { Low:'border-green-600', Medium:'border-yellow-500', High:'border-orange-500', Critical:'border-red-500' };
+  if (severity) el.classList.add(borderMap[severity] || 'border-transparent');
+  if (id === selectedId) el.classList.add('bg-gray-900');
+}
+
+function feedItemHTML(id, subject, sender, status, severity, rec) {
+  const statusEl = {
+    processing: `<span class="text-xs text-yellow-400 flex items-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-yellow-400 animate-pulse inline-block"></span>Fetching</span>`,
+    analysing:  `<span class="text-xs text-blue-400 flex items-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse inline-block"></span>Analysing</span>`,
+    error:      `<span class="text-xs text-red-400">Error</span>`,
+    done:       `<span class="text-xs ${REC_CLS[rec] || 'text-gray-400'}">${REC_ICON[rec] || '•'} ${rec}</span>`,
+  }[status] || '';
+
+  return `
+    <div class="flex items-start justify-between gap-2">
+      <div class="min-w-0 flex-1">
+        <p class="text-xs font-medium text-gray-200 truncate">${escHtml(subject || '(no subject)')}</p>
+        <p class="text-xs text-gray-500 truncate">${escHtml(sender || '')}</p>
+      </div>
+      ${severity ? `<span class="shrink-0 text-xs px-1.5 py-0.5 rounded border ${SEV_CLS[severity] || ''}">${severity}</span>` : ''}
+    </div>
+    <div class="mt-1">${statusEl}</div>`;
+}
+
+function selectEmail(id) {
+  selectedId = id;
+  // Update feed selection highlight
+  document.querySelectorAll('[id^="feed-"]').forEach(el => el.classList.remove('bg-gray-900'));
+  const el = document.getElementById(`feed-${id}`);
+  if (el) el.classList.add('bg-gray-900');
+
+  if (reports[id]) {
+    renderReport(id);
+  } else {
+    showLoading(id, 'Running 10-agent pipeline…');
+  }
+}
+
+function clearFeed() {
+  document.getElementById('emailFeed').innerHTML = `
+    <div class="flex flex-col items-center justify-center h-48 text-gray-700 text-xs gap-2">
+      <span>Waiting for emails…</span>
+    </div>`;
+  reports = {}; pendingIds = {};
+  selectedId = null;
+  document.getElementById('detailContent').classList.add('hidden');
+  document.getElementById('detailEmpty').classList.remove('hidden');
+  stats = { total: 0, threats: 0, safe: 0 };
+  updateStats();
+}
+
+function updateStats() {
+  document.getElementById('statTotal').textContent   = stats.total;
+  document.getElementById('statThreats').textContent = stats.threats;
+  document.getElementById('statSafe').textContent    = stats.safe;
+}
+</script>
+
+<script>
+// ── Loading view ──────────────────────────────────────────────────────────────
+const AGENTS = ['Parser','Classifier','Summarizer','Security','URLs','Attachments','Web Search','Reply','Decision','Actions'];
+
+function showLoading(id, text) {
+  document.getElementById('detailEmpty').classList.add('hidden');
+  document.getElementById('detailContent').classList.add('hidden');
+  document.getElementById('detailLoading').classList.remove('hidden');
+  document.getElementById('loadingText').textContent = text;
+  const prog = document.getElementById('agentProgress');
+  prog.innerHTML = AGENTS.map((a,i) => `
+    <span id="agent-${i}" class="px-2 py-1 rounded text-xs bg-gray-800 text-gray-500">${a}</span>
+  `).join('');
+  // Animate agents lighting up
+  AGENTS.forEach((_,i) => setTimeout(() => {
+    const el = document.getElementById(`agent-${i}`);
+    if (el) el.className = 'px-2 py-1 rounded text-xs bg-brand/20 text-indigo-300';
+  }, i * 400));
+}
+
+// ── Report renderer ───────────────────────────────────────────────────────────
+function renderReport(id) {
+  const r = reports[id];
+  if (!r) return;
+
+  document.getElementById('detailLoading').classList.add('hidden');
+  document.getElementById('detailEmpty').classList.add('hidden');
+  const content = document.getElementById('detailContent');
+  content.classList.remove('hidden');
+  content.innerHTML = buildFullReport(r);
+}
+
+function buildFullReport(r) {
+  const sec  = r.security    || {};
+  const dec  = r.decision    || {};
+  const cls  = r.classification || {};
+  const sum  = r.summary     || {};
+  const rep  = r.reputation  || {};
+  const repl = r.suggested_reply || {};
+  const meta = r.email_metadata  || {};
+  const gmailMeta = r.gmail || {};
+  const actions = r.mcp_actions || [];
+  const score = sec.risk_score ?? 0;
+  const sev   = sec.severity || 'Low';
+  const rec   = dec.recommendation || '—';
+
+  const barColor = score>=75?'bg-red-500':score>=40?'bg-orange-400':score>=15?'bg-yellow-400':'bg-green-500';
+
+  // Decision card
+  const decCard = card('Final Decision', `
+    <div class="flex items-start gap-4">
+      <div class="flex-1">
+        <p class="text-xl font-bold ${REC_CLS[rec]||'text-gray-200'}">${REC_ICON[rec]||'•'} ${rec}</p>
+        <p class="text-sm text-gray-400 mt-1">${escHtml(dec.reasoning||'')}</p>
+      </div>
+      <div class="text-right shrink-0">
+        <span class="inline-block px-2 py-1 rounded-md border text-sm font-semibold ${SEV_CLS[sev]||''}">${sev}</span>
+        <p class="text-xs text-gray-500 mt-1">Risk: <b class="text-white">${score}/100</b></p>
+      </div>
+    </div>
+  `, 'border-l-4 border-brand');
+
+  // Email header
+  const headerCard = card('Email', `
+    <dl class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-sm">
+      <dt class="text-gray-500">From</dt>   <dd class="text-gray-200 truncate">${escHtml(meta.sender||'')}</dd>
+      <dt class="text-gray-500">Subject</dt><dd class="text-gray-200">${escHtml(meta.subject||'')}</dd>
+      <dt class="text-gray-500">Category</dt><dd>${pill(cls.category||'Unknown','bg-brand/20 text-indigo-300')} <span class="text-xs text-gray-500">${escHtml(cls.reason||'')}</span></dd>
+      <dt class="text-gray-500">Gmail ID</dt><dd class="text-gray-600 font-mono text-xs">${gmailMeta.message_id||'—'}</dd>
+    </dl>
+  `);
+
+  // Risk bar + findings
+  const secCard = card('Security Analysis', `
+    <div class="flex items-center gap-3 mb-4">
+      <div class="flex-1 h-2 bg-gray-800 rounded-full overflow-hidden">
+        <div class="${barColor} h-full rounded-full" style="width:${score}%"></div>
+      </div>
+      <span class="text-sm font-bold">${score}/100</span>
+    </div>
+    <p class="text-sm text-gray-400 mb-3">${escHtml(sec.explanation||'')}</p>
+    ${(sec.findings||[]).length ? (sec.findings||[]).map(f=>`
+      <div class="bg-gray-800 rounded-lg px-3 py-2 mb-2">
+        <div class="flex items-center gap-2 mb-0.5">
+          <span class="text-xs font-semibold text-red-300">${escHtml(f.threat_type)}</span>
+          ${pill(f.confidence, f.confidence==='high'?'bg-red-900 text-red-300':f.confidence==='medium'?'bg-yellow-900 text-yellow-300':'bg-gray-700 text-gray-400')}
+        </div>
+        <p class="text-xs text-gray-400">${escHtml(f.description)}</p>
+      </div>`).join('') : '<p class="text-xs text-green-400">✓ No threats detected</p>'}
+  `);
+
+  // Summary
+  const sumCard = card('Summary', `
+    <p class="text-sm text-gray-200 font-medium mb-1">${escHtml(sum.short||'—')}</p>
+    <p class="text-xs text-gray-400 mb-3">${escHtml(sum.detailed||'')}</p>
+    <div class="grid grid-cols-2 gap-3">
+      <div><p class="text-xs text-gray-500 mb-1">Action Items</p>${listItems(sum.action_items)}</div>
+      <div><p class="text-xs text-gray-500 mb-1">Deadlines</p>${listItems(sum.deadlines)}</div>
+      ${sum.meeting_requests?.length?`<div><p class="text-xs text-gray-500 mb-1">Meetings</p>${listItems(sum.meeting_requests)}</div>`:''}
+      ${sum.payment_requests?.length?`<div><p class="text-xs text-gray-500 mb-1">Payments</p>${listItems(sum.payment_requests)}</div>`:''}
+    </div>
+  `);
+
+  // URLs
+  const urlData = r.url_analysis || [];
+  const urlCard = card('URL Analysis', urlData.length ? urlData.map(u=>`
+    <div class="bg-gray-800 rounded-lg px-3 py-2 mb-2">
+      <div class="flex flex-wrap items-center gap-1.5 mb-1">
+        <span class="text-xs font-mono text-gray-300 truncate max-w-xs">${escHtml(u.url)}</span>
+        ${u.suspicious?badge('Suspicious','bg-red-900 text-red-300 border-red-700'):badge('Clean','bg-green-900 text-green-300 border-green-700')}
+        ${!u.is_https?badge('HTTP','bg-yellow-900 text-yellow-300 border-yellow-700'):''}
+        ${u.is_shortened?badge('Shortened','bg-orange-900 text-orange-300 border-orange-700'):''}
+      </div>
+      ${u.reasons?.length?`<p class="text-xs text-gray-500">${u.reasons.map(escHtml).join(' · ')}</p>`:''}
+    </div>`).join('') : '<p class="text-xs text-gray-600 italic">No URLs found</p>');
+
+  // Attachments
+  const attData = r.attachment_analysis || [];
+  const attCard = card('Attachments', attData.length ? attData.map(a=>`
+    <div class="bg-gray-800 rounded-lg px-3 py-2 mb-2">
+      <div class="flex items-center gap-2">
+        <span class="text-xs font-mono text-gray-300">${escHtml(a.filename)}</span>
+        ${a.suspicious?badge('Suspicious','bg-red-900 text-red-300 border-red-700'):badge('OK','bg-green-900 text-green-300 border-green-700')}
+      </div>
+      ${a.reasons?.length?`<p class="text-xs text-red-400 mt-1">${a.reasons.map(escHtml).join(' · ')}</p>`:''}
+    </div>`).join('') : '<p class="text-xs text-gray-600 italic">No attachments</p>');
+
+  // MCP Actions
+  const actCard = card('Gmail Actions Taken (MCP)', actions.length ? actions.map(a=>`
+    <div class="flex items-start gap-2 py-1">
+      <span class="${
+        ['done','sent','labeled','trashed','archived','read','unread'].includes(a.status)?'text-green-400':
+        ['refused'].includes(a.status)?'text-orange-400':
+        ['failed','error'].includes(a.status)?'text-red-400':
+        'text-gray-500'
+      } text-xs">${
+        ['done','sent','labeled','trashed','archived','read','unread'].includes(a.status)?'✓':
+        ['refused'].includes(a.status)?'🚫':
+        ['failed','error'].includes(a.status)?'✗':
+        '⏳'
+      }</span>
+      <span class="text-xs text-gray-300 font-mono">${escHtml(a.action)}</span>
+      <span class="text-xs text-gray-500 ml-auto text-right max-w-[200px] break-words">${escHtml(a.detail)}</span>
+    </div>`).join('') : '<p class="text-xs text-gray-600 italic">No actions taken</p>');
+
+  // Reply
+  const replCard = repl.draft ? card('Suggested Reply', `
+    <div class="flex items-center gap-2 mb-2">
+      <span class="text-xs text-gray-500">Tone: ${repl.tone}</span>
+      <button onclick="copyText(this)" data-text="${escAttr(repl.draft)}"
+        class="ml-auto text-xs text-brand hover:underline">Copy</button>
+    </div>
+    <div class="bg-gray-800 rounded-lg p-3 text-sm text-gray-200 whitespace-pre-line">${escHtml(repl.draft)}</div>
+  `) : '';
+
+  // Errors
+  const errs = r.errors || [];
+  const errCard = errs.length ? card('Pipeline Warnings',
+    errs.map(e=>`<p class="text-xs text-yellow-400">⚠ ${escHtml(e)}</p>`).join('')
+  ) : '';
+
+  return [decCard, headerCard, secCard, sumCard, urlCard, attCard, actCard, replCard, errCard]
+    .filter(Boolean).join('');
+}
+
+// ── HTML helpers ───────────────────────────────────────────────────────────────
+function card(title, content, extra='') {
+  return `<div class="bg-gray-900 border border-gray-800 rounded-xl p-4 ${extra}">
+    <h3 class="text-xs font-semibold uppercase tracking-widest text-gray-500 mb-3">${title}</h3>
+    ${content}
+  </div>`;
+}
+function badge(t,c) { return `<span class="inline-block px-1.5 py-0.5 rounded border text-xs font-medium ${c}">${t}</span>`; }
+function pill(t,c='bg-gray-800 text-gray-300') { return `<span class="inline-block px-2 py-0.5 rounded text-xs ${c}">${t}</span>`; }
+function listItems(arr) {
+  if (!arr?.length) return '<p class="text-xs text-gray-600 italic">None</p>';
+  return '<ul class="space-y-0.5">'+ arr.map(i=>`<li class="text-xs text-gray-300 flex gap-1.5"><span class="text-brand">›</span>${escHtml(i)}</li>`).join('') +'</ul>';
+}
+function escHtml(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function escAttr(s) { return escHtml(s).replace(/'/g,'&#39;'); }
+function copyText(btn) {
+  navigator.clipboard.writeText(btn.getAttribute('data-text')).then(()=>{
+    btn.textContent='Copied!'; setTimeout(()=>btn.textContent='Copy',2000);
+  });
+}
+
+// ── Event Log ─────────────────────────────────────────────────────────────────
+function log(level, msg) {
+  logCount++;
+  const panel = document.getElementById('logPanel');
+  const time  = new Date().toLocaleTimeString();
+  const cls   = { system:'text-gray-600', info:'text-gray-400', error:'text-red-400' }[level]||'text-gray-400';
+  const el    = document.createElement('div');
+  el.className = cls;
+  el.textContent = `[${time}] ${msg}`;
+  panel.appendChild(el);
+  panel.scrollTop = panel.scrollHeight;
+  document.getElementById('logBadge').textContent = logCount;
+}
+
+function toggleLog() {
+  const p = document.getElementById('logPanel');
+  const c = document.getElementById('logChevron');
+  p.classList.toggle('hidden');
+  c.classList.toggle('rotate-180');
+}
+</script>
+
+</body>
+</html>
